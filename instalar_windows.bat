@@ -46,7 +46,8 @@ if %errorlevel% neq 0 (
 
 :: 3. Converter o caminho do projeto para o formato do Linux (/mnt/c/...)
 echo [3/4] Identificando diretório do projeto no subsistema Linux...
-for /f "tokens=*" %%a in ('wsl wslpath -u "%SCRIPT_DIR%"') do set "WSL_PROJECT_DIR=%%a"
+for /f "tokens=*" %%a in ('wsl -d Ubuntu wslpath -u "%SCRIPT_DIR%" 2^>nul ^|^| wsl wslpath -u "%SCRIPT_DIR%" 2^>nul') do set "WSL_PROJECT_DIR=%%a"
+set "WSL_PROJECT_DIR=%WSL_PROJECT_DIR:/mnt/host/=/mnt/%"
 
 echo    Diretório Windows: %SCRIPT_DIR%
 echo    Diretório WSL:     %WSL_PROJECT_DIR%

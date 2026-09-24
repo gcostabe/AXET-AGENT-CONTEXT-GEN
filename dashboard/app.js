@@ -379,6 +379,7 @@ function renderPipelineStepperForRun(runId) {
 
     const node = document.createElement("div");
     node.className = `stepper-step-node ${status}`;
+    node.dataset.step = stepKey;
 
     let statusSymbol = idx + 1;
     if (status === "success") statusSymbol = "✓";
@@ -434,6 +435,7 @@ function renderStepCardsForRun(runId) {
 
     const card = document.createElement("div");
     card.className = `step-card ${status}`;
+    card.dataset.step = stepKey;
 
     // 1. Cabeçalho da etapa com número, nome e tag de status
     const topRow = document.createElement("div");
@@ -467,11 +469,13 @@ function renderStepCardsForRun(runId) {
       durStr = formatDuration(elap);
     }
 
+    const showDur = Boolean(durStr) || status === "running";
     timingRow.innerHTML = `
       <span class="timing-item" title="Hora de início da etapa"><span class="timing-lbl">Início:</span> <strong>${startStr}</strong></span>
       <span class="timing-sep">·</span>
       <span class="timing-item" title="Hora de término da etapa"><span class="timing-lbl">Fim:</span> <strong>${endStr}</strong></span>
-      ${durStr ? `<span class="timing-sep">·</span><span class="timing-dur" title="Duração da etapa">⏱ <strong>${durStr}</strong></span>` : ""}
+      <span class="timing-sep timing-dur-sep" style="${showDur ? '' : 'display:none;'}">·</span>
+      <span class="timing-dur" title="Duração da etapa" style="${showDur ? '' : 'display:none;'}">⏱ <strong data-role="timing-dur">${durStr || "0s"}</strong></span>
     `;
     card.appendChild(timingRow);
 
@@ -541,6 +545,30 @@ function updateStepProgressUI(runId, stepKey) {
   const labelEl = progWrap.querySelector('[data-role="step-progress-label"]');
   if (fillEl) fillEl.style.width = `${pct}%`;
   if (labelEl) labelEl.textContent = `${Math.round(pct)}%`;
+
+  // Atualiza texto de detalhes técnicos e tag de status no step card diretamente sem recriar todo o DOM
+  const cardEl = els.stepsEl.querySelector(`.step-card[data-step="${stepKey}"]`) || progWrap.closest(".step-card");
+  if (cardEl) {
+    if (stepData.detalhes) {
+      const detailEl = cardEl.querySelector(".step-detail");
+      if (detailEl) detailEl.textContent = stepData.detalhes;
+    }
+    const statusTag = cardEl.querySelector(".step-status-tag");
+    if (statusTag && stepData.status === "running") {
+      statusTag.textContent = pct > 0 ? `Em andamento (${Math.round(pct)}%)` : "Em andamento";
+    }
+  }
+
+  // Atualiza porcentagem no stepper horizontal da pipeline
+  if (els.pipelineStepperEl) {
+    const stepNode = els.pipelineStepperEl.querySelector(`.stepper-step-node[data-step="${stepKey}"]`);
+    if (stepNode) {
+      const noteEl = stepNode.querySelector(".stepper-status-note");
+      if (noteEl && stepData.status === "running") {
+        noteEl.textContent = `${Math.round(pct)}%`;
+      }
+    }
+  }
 }
 
 function updateProgressBarForRun(runId) {
@@ -1536,6 +1564,9 @@ function applyEventLocally(evt) {
         run.steps[step].finished_at = null;
       }
       run.steps[step].progress_pct = evt.pct != null ? evt.pct : run.steps[step].progress_pct;
+      if (evt.message || evt.detalhes) {
+        run.steps[step].detalhes = evt.message || evt.detalhes;
+      }
       break;
 
     case "step_end":
@@ -1594,9 +1625,8 @@ function applyEventLocally(evt) {
       renderStepCardsForRun(run_id);
     }
     if (type === "step_progress") {
-      renderStepCardsForRun(run_id);
       updateStepProgressUI(run_id, step);
-      updateQueueItemProgress(run_id, step, evt.pct);
+      updateQueueItemProgress(run_id, step, evt.pct, evt.message || evt.detalhes);
     }
     if (type === "log") {
       appendLogLineToRun(run_id, {
@@ -1883,7 +1913,7 @@ function renderBatchState(batch) {
   const isStopped = batch.status === "stopped";
 
   // Se o lote estiver em execução, reflete os valores fixos do lote ativo.
-  // Se o lote estiver ocioso/parado, JAMAIS sobrescreve a escolha manual ou seleção de pasta feita pelo usuário!
+  // Se o lote estiver ocioso/parado, JAMAIS sobrescreve a escolha manual ou seleção feita pelo usuário!
   if (isRunning || isStopping) {
     if (batchInputDir && batch.inputDir) batchInputDir.value = batch.inputDir;
     if (batchOutputDir && batch.outputDir) batchOutputDir.value = batch.outputDir;
@@ -1909,8 +1939,26 @@ function renderBatchState(batch) {
       batchOutputDir.value = savedOut || batch.outputDir;
     }
     if (batchParallelism && !batchParallelism.value && batch.parallelism) {
-      batchParallelism.value = batch.parallelism;
-      updateParallelismHint(batch.parallelism);
+      const savedPar = localStorage.getItem("axet_batch_parallelism");
+      batchParallelism.value = savedPar || batch.parallelism;
+      updateParallelismHint(batchParallelism.value);
+    }
+    if (batchWhisperModel && !batchWhisperModel.value) {
+      const savedWhisper = localStorage.getItem("axet_batch_whisper_model");
+      batchWhisperModel.value = savedWhisper || batch.whisperModel || "small";
+    }
+    if (batchWhisperLang && !batchWhisperLang.value) {
+      const savedLang = localStorage.getItem("axet_batch_whisper_lang");
+      batchWhisperLang.value = savedLang || batch.whisperLanguage || "es";
+    }
+    if (batchAxetModel && !batchAxetModel.value) {
+      const savedAxet = localStorage.getItem("axet_batch_axet_model");
+      batchAxetModel.value = savedAxet || batch.axetModel || "gpt-5.6-terra";
+    }
+    if (batchVideoVisionMode && !batchVideoVisionMode.value) {
+      const savedVision = localStorage.getItem("axet_batch_video_vision_mode");
+      batchVideoVisionMode.value = savedVision || batch.videoVisionMode || "vision_ocr";
+      updateVisionModeHint(batchVideoVisionMode.value);
     }
   }
 
@@ -1951,22 +1999,6 @@ function renderBatchState(batch) {
   if (btnBrowseOutput) btnBrowseOutput.disabled = isRunning || isStopping;
   if (btnScanVideos) btnScanVideos.disabled = isRunning || isStopping;
   if (batchSkipCompleted) batchSkipCompleted.disabled = isRunning || isStopping;
-
-  if (batchWhisperModel && batch.whisperModel) batchWhisperModel.value = batch.whisperModel;
-  if (batchWhisperLang && batch.whisperLanguage) batchWhisperLang.value = batch.whisperLanguage;
-  if (batchAxetModel && batch.axetModel) batchAxetModel.value = batch.axetModel;
-  if (batchVideoVisionMode) {
-    if (batch && batch.videoVisionMode) {
-      batchVideoVisionMode.value = batch.videoVisionMode;
-      updateVisionModeHint(batch.videoVisionMode);
-    } else {
-      const savedMode = localStorage.getItem("axet_batch_video_vision_mode");
-      if (savedMode) {
-        batchVideoVisionMode.value = savedMode;
-        updateVisionModeHint(savedMode);
-      }
-    }
-  }
 
   // Atualiza estatísticas
   const stats = batch.stats || { total: 0, running: 0, completed: 0, pending: 0, errors: 0, cancelled: 0 };
@@ -2419,10 +2451,11 @@ function getPipelineStepInfo(item) {
         subtext: detailMsg || "Parser estruturado, tabelas e metadados",
       };
     } else if (stepKey === "interpretacao_axet") {
+      const hasPct = pct != null && pct > 0;
       return {
-        label: "[2/3] Análise RAG (axet-code)",
+        label: hasPct ? `[2/3] RAG: ${Math.round(pct)}%` : "[2/3] Análise RAG (axet-code)",
         stepNum: 2,
-        pct: null,
+        pct: pct != null ? pct : null,
         badgeClass: "step-axet",
         subtext: detailMsg || "Estruturação profunda para RAG",
       };
@@ -2462,12 +2495,13 @@ function getPipelineStepInfo(item) {
       subtext: hasPct ? `${pct}% do áudio transcrito` : (detailMsg || "Carregando modelo Whisper..."),
     };
   } else if (stepKey === "interpretacao_axet") {
+    const hasPct = pct != null && pct > 0;
     return {
-      label: "[3/4] Análise IA (axet-code)",
+      label: hasPct ? `[3/4] Análise RAG: ${Math.round(pct)}%` : "[3/4] Análise IA (axet-code)",
       stepNum: 3,
-      pct: null,
+      pct: pct != null ? pct : null,
       badgeClass: "step-axet",
-      subtext: "Estruturação sênior anti-alucinação",
+      subtext: detailMsg || "Estruturação profunda para RAG",
     };
   } else if (stepKey === "geracao_markdown") {
     return {
@@ -2706,19 +2740,20 @@ function renderQueueTable(queue) {
     .join("");
 }
 
-function updateQueueItemProgress(runId, step, pct) {
+function updateQueueItemProgress(runId, step, pct, msg) {
   if (!currentBatch || !currentBatch.queue) return;
   const item = currentBatch.queue.find((q) => q.runId === runId);
   if (!item) return;
   item.currentStep = step;
   if (pct != null) item.currentStepProgress = pct;
+  if (msg) item.currentStepMessage = msg;
   const cell = document.getElementById(`queue-step-cell-${item.id}`);
   if (!cell) return;
   const stepInfo = getPipelineStepInfo(item);
   cell.innerHTML = `
     <div class="queue-step-header">
-      <span class="queue-step-tag ${stepInfo.badgeClass}">${escapeHtml(stepInfo.label)}</span>
-      ${stepInfo.pct != null ? `<span class="queue-step-pct">${stepInfo.pct}%</span>` : ""}
+      <span class="queue-step-tag ${stepInfo.badgeClass}">⚡ ${escapeHtml(stepInfo.label)}</span>
+      ${stepInfo.pct != null ? `<span class="queue-step-pct">${Math.round(stepInfo.pct)}%</span>` : ""}
     </div>
     ${
       stepInfo.pct != null
@@ -3016,6 +3051,16 @@ async function startBatchExecution(isResume = false) {
     return;
   }
 
+  // Persiste escolhas do lote no localStorage para resiliência total
+  localStorage.setItem("axet_batch_input_dir", inputDir);
+  localStorage.setItem("axet_batch_output_dir", outputDir);
+  localStorage.setItem("axet_batch_parallelism", String(parallelism));
+  localStorage.setItem("axet_batch_whisper_model", whisperModel);
+  localStorage.setItem("axet_batch_whisper_lang", whisperLanguage);
+  localStorage.setItem("axet_batch_axet_model", axetModel);
+  localStorage.setItem("axet_batch_video_vision_mode", videoVisionMode);
+  localStorage.setItem("axet_batch_skip_completed", skipCompleted ? "true" : "false");
+
   if (batchStartBtn) batchStartBtn.disabled = true;
   if (batchResumeBtn) batchResumeBtn.disabled = true;
   if (batchStatusBadge) {
@@ -3174,6 +3219,42 @@ if (batchVideoVisionMode) {
   });
 }
 
+if (batchWhisperModel) {
+  batchWhisperModel.addEventListener("change", () => {
+    const val = batchWhisperModel.value;
+    if (val) {
+      localStorage.setItem("axet_batch_whisper_model", val);
+      saveBatchConfigToServer({ whisperModel: val });
+    }
+  });
+}
+
+if (batchWhisperLang) {
+  batchWhisperLang.addEventListener("change", () => {
+    const val = batchWhisperLang.value;
+    if (val) {
+      localStorage.setItem("axet_batch_whisper_lang", val);
+      saveBatchConfigToServer({ whisperLanguage: val });
+    }
+  });
+}
+
+if (batchAxetModel) {
+  batchAxetModel.addEventListener("change", () => {
+    const val = batchAxetModel.value;
+    if (val) {
+      localStorage.setItem("axet_batch_axet_model", val);
+      saveBatchConfigToServer({ axetModel: val });
+    }
+  });
+}
+
+if (batchSkipCompleted) {
+  batchSkipCompleted.addEventListener("change", () => {
+    localStorage.setItem("axet_batch_skip_completed", batchSkipCompleted.checked ? "true" : "false");
+  });
+}
+
 if (btnDecPar) {
   btnDecPar.addEventListener("click", () => {
     let val = parseInt(batchParallelism.value, 10) || 2;
@@ -3181,6 +3262,8 @@ if (btnDecPar) {
       val--;
       batchParallelism.value = val;
       updateParallelismHint(val);
+      localStorage.setItem("axet_batch_parallelism", String(val));
+      saveBatchConfigToServer({ parallelism: val });
     }
   });
 }
@@ -3192,6 +3275,8 @@ if (btnIncPar) {
       val++;
       batchParallelism.value = val;
       updateParallelismHint(val);
+      localStorage.setItem("axet_batch_parallelism", String(val));
+      saveBatchConfigToServer({ parallelism: val });
     }
   });
 }
@@ -3202,6 +3287,8 @@ if (batchParallelism) {
     if (val < 1) val = 1;
     if (val > 8) val = 8;
     updateParallelismHint(val);
+    localStorage.setItem("axet_batch_parallelism", String(val));
+    saveBatchConfigToServer({ parallelism: val });
   });
 }
 
@@ -3691,12 +3778,13 @@ async function loadAxetModels() {
     const res = await fetch("/api/axet/models");
     const data = await res.json();
     if (data.ok && Array.isArray(data.models) && data.models.length > 0 && batchAxetModel) {
-      const selectedVal = (currentBatch && currentBatch.axetModel) || batchAxetModel.value || "gpt-5.6-terra";
+      const savedAxet = localStorage.getItem("axet_batch_axet_model");
+      const selectedVal = savedAxet || (currentBatch && currentBatch.axetModel) || batchAxetModel.value || "gpt-5.6-terra";
       batchAxetModel.innerHTML = data.models
         .map(
           (m) =>
             `<option value="${escapeHtml(m.id)}"${
-              m.id === selectedVal || m.id === "gpt-5.6-terra" ? " selected" : ""
+              m.id === selectedVal ? " selected" : ""
             }>${escapeHtml(m.name)}</option>`
         )
         .join("");
@@ -3737,6 +3825,40 @@ async function loadInitialState() {
       batchInputDir.value = savedIn;
       saveBatchConfigToServer({ inputDir: savedIn });
     }
+    const savedWhisper = localStorage.getItem("axet_batch_whisper_model");
+    if (savedWhisper && batchWhisperModel) {
+      batchWhisperModel.value = savedWhisper;
+      saveBatchConfigToServer({ whisperModel: savedWhisper });
+    }
+    const savedLang = localStorage.getItem("axet_batch_whisper_lang");
+    if (savedLang && batchWhisperLang) {
+      batchWhisperLang.value = savedLang;
+      saveBatchConfigToServer({ whisperLanguage: savedLang });
+    }
+    const savedAxet = localStorage.getItem("axet_batch_axet_model");
+    if (savedAxet && batchAxetModel) {
+      batchAxetModel.value = savedAxet;
+      saveBatchConfigToServer({ axetModel: savedAxet });
+    }
+    const savedPar = localStorage.getItem("axet_batch_parallelism");
+    if (savedPar && batchParallelism) {
+      const p = parseInt(savedPar, 10);
+      if (p >= 1 && p <= 8) {
+        batchParallelism.value = p;
+        updateParallelismHint(p);
+        saveBatchConfigToServer({ parallelism: p });
+      }
+    }
+    const savedVision = localStorage.getItem("axet_batch_video_vision_mode");
+    if (savedVision && batchVideoVisionMode) {
+      batchVideoVisionMode.value = savedVision;
+      updateVisionModeHint(savedVision);
+      saveBatchConfigToServer({ videoVisionMode: savedVision });
+    }
+    const savedSkip = localStorage.getItem("axet_batch_skip_completed");
+    if (savedSkip !== null && batchSkipCompleted) {
+      batchSkipCompleted.checked = savedSkip === "true";
+    }
 
     const batchRes = await fetch("/api/batch/status");
     const batchData = await batchRes.json();
@@ -3775,6 +3897,65 @@ function connectSSE() {
 }
 
 // ---------------------------------------------------------------------------
+// Ticker Dinâmico de Tempo Real (1s) para Runs e Etapas em Execução
+// ---------------------------------------------------------------------------
+
+function tickActiveTimers() {
+  const now = Date.now();
+
+  // 1. Atualiza cronômetro de cada execução ativa na interface
+  Object.keys(runCardEls).forEach((runId) => {
+    const run = allRuns[runId];
+    const els = runCardEls[runId];
+    if (!run || !els || run.status !== "running") return;
+
+    // Atualiza tempo total decorrido do card no topo
+    if (run.started_at && els.cardMetaEl) {
+      const totalElap = Math.max(0, (now - new Date(run.started_at).getTime()) / 1000);
+      const metaDurEl = els.cardMetaEl.querySelector(".meta-dur");
+      if (metaDurEl) {
+        metaDurEl.textContent = `${formatDuration(totalElap)} (ativo)`;
+      }
+    }
+
+    // Atualiza tempo decorrido do step ativo (running) segundo a segundo
+    if (run.steps) {
+      Object.entries(run.steps).forEach(([stepKey, stepData]) => {
+        if (stepData && stepData.status === "running" && stepData.started_at) {
+          const stepElap = Math.max(0, (now - new Date(stepData.started_at).getTime()) / 1000);
+          const durText = formatDuration(stepElap);
+
+          const card = els.stepsEl.querySelector(`.step-card[data-step="${stepKey}"]`);
+          if (card) {
+            const durStrong = card.querySelector('[data-role="timing-dur"]');
+            if (durStrong) {
+              durStrong.textContent = durText;
+              const durSpan = durStrong.closest(".timing-dur");
+              if (durSpan) durSpan.style.display = "";
+              const sep = card.querySelector(".timing-dur-sep");
+              if (sep) sep.style.display = "";
+            }
+          }
+        }
+      });
+    }
+  });
+
+  // 2. Se a fila de lote estiver renderizada com itens em execução, atualiza tempo decorrido
+  if (currentBatch && currentBatch.queue && currentBatch.queue.length > 0) {
+    currentBatch.queue.forEach((it) => {
+      if (it.status === "running" && it.started_at) {
+        const rowEl = document.querySelector(`tr[data-batch-id="${it.id}"] .batch-item-dur`);
+        if (rowEl) {
+          const elap = Math.max(0, (now - new Date(it.started_at).getTime()) / 1000);
+          rowEl.textContent = formatDuration(elap);
+        }
+      }
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Inicialização e Redraw Periódico
 // ---------------------------------------------------------------------------
 
@@ -3784,11 +3965,12 @@ window.addEventListener("resize", () => {
   }
 });
 
-// Mantém animação do gráfico fluida a cada segundo quando na aba de telemetria
+// Mantém animação do gráfico fluida e timer ao vivo a cada segundo
 setInterval(() => {
   if (currentCockpitTab === "storage") {
     drawCpuRamChart();
   }
+  tickActiveTimers();
 }, 1000);
 
 renderActiveRunsEmptyState();

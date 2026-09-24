@@ -202,8 +202,13 @@ EOF
 emit_step_progress() {
   local step="$1"
   local pct="$2"
+  local msg="${3:-}"
+  local escaped_msg=""
+  if [[ -n "$msg" ]]; then
+    escaped_msg="$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  fi
   emit_telemetry "$(cat <<EOF
-{"type":"step_progress","run_id":"$RUN_ID","step":"$step","pct":$pct,"ts":"$(now_iso)"}
+{"type":"step_progress","run_id":"$RUN_ID","step":"$step","pct":$pct,"message":"$escaped_msg","ts":"$(now_iso)"}
 EOF
 )"
 }
@@ -457,7 +462,10 @@ if [[ "$USE_WHISPER_CPP" == true ]]; then
     --flash-attn
     -pp
     --suppress-nst
-    -mc 256
+    -mc 0
+    -nf
+    -bs 1
+    -bo 1
     -otxt
     -of "${TRANSCRIPT_TXT%.txt}"
   )
@@ -544,9 +552,9 @@ if [[ ! -f "$TRANSCRIPT_TXT" ]]; then
   exit 1
 fi
 
-# Sanitização: remove linhas residuais que contenham apenas [BLANK_AUDIO]
+# Sanitização: remove linhas residuais que contenham apenas [BLANK_AUDIO] e deduplica repetições consecutivas idênticas (loops alucinatórios)
 TMP_CLEAN="$(mktemp -t transcript_clean_XXXXXX.txt)"
-grep -v -E "^\s*\[BLANK_AUDIO\]\s*$" "$TRANSCRIPT_TXT" > "$TMP_CLEAN" || true
+grep -v -E "^\s*\[BLANK_AUDIO\]\s*$" "$TRANSCRIPT_TXT" | awk 'NR==1 || $0!=prev {print; prev=$0}' > "$TMP_CLEAN" || true
 if [[ -s "$TMP_CLEAN" ]]; then
   mv "$TMP_CLEAN" "$TRANSCRIPT_TXT"
 else
@@ -575,64 +583,75 @@ CURRENT_STEP="interpretacao_axet"
 emit_step_start "interpretacao_axet"
 
 MULTIMODAL_SUCCESS=false
+OCR_CONTEXT_FILE=""
 
-# Verifica se o modo multimodal está ativo e se há frames extraídos
+# Verifica se o modo multimodal está ativo e se há frames extraídos para OCR
 if [[ "$VIDEO_VISION_MODE" == "vision_ocr" && -d "$FRAMES_DIR" && $(ls -1 "$FRAMES_DIR"/*.jpg 2>/dev/null | wc -l) -gt 0 ]]; then
-  echo "[3/4] Interpretando fala e telas com Visão Multimodal (modelo: $AXET_MODEL_LABEL)..."
-  emit_log "INFO" "interpretacao_axet" "Iniciando análise multimodal (Whisper + OCR de Telas via LLM Gateway)..."
+  echo "[3/4] Extraindo OCR das telas do vídeo com Claude Sonnet 5..."
+  emit_log "INFO" "interpretacao_axet" "Iniciando extração de OCR das telas via LLM Gateway..."
+  emit_step_progress "interpretacao_axet" 5 "[1/5] Extraindo telas e OCR dos frames com Claude Sonnet 5..."
 
-  MULTIMODAL_SCRIPT="$ROOT_DIR/scripts/analyze_video_multimodal.py"
-  MULTIMODAL_OUT="$TEMP_WORKSPACE/multimodal_output.md"
+  OCR_CONTEXT_FILE="$TEMP_WORKSPACE/ocr_context.txt"
   MULTIMODAL_ERR="$TEMP_WORKSPACE/multimodal_error.log"
 
-  if LLM_GATEWAY_URL="$LLM_GATEWAY_URL" python3 "$MULTIMODAL_SCRIPT" \
-      "$TRANSCRIPT_TXT" \
-      "$FRAMES_DIR" \
-      "$PROMPT_MULTIMODAL" \
-      "$MULTIMODAL_OUT" \
-      "$AXET_MODEL_LABEL" 2>"$MULTIMODAL_ERR"; then
-    if [[ -s "$MULTIMODAL_OUT" && $(wc -c < "$MULTIMODAL_OUT") -gt 150 ]]; then
-      AXET_OUTPUT="$(cat "$MULTIMODAL_OUT")"
+  if LLM_GATEWAY_URL="$LLM_GATEWAY_URL" python3 "$ROOT_DIR/scripts/analyze_video_multimodal.py" \
+      --ocr-only "$FRAMES_DIR" "$OCR_CONTEXT_FILE" 2>"$MULTIMODAL_ERR"; then
+    if [[ -s "$OCR_CONTEXT_FILE" && $(wc -c < "$OCR_CONTEXT_FILE") -gt 50 ]]; then
       MULTIMODAL_SUCCESS=true
-      emit_log "INFO" "interpretacao_axet" "Análise multimodal e OCR concluídos com sucesso via LLM Gateway."
+      emit_log "INFO" "interpretacao_axet" "OCR visual extraído com sucesso ($(wc -c < "$OCR_CONTEXT_FILE" | tr -d ' ') bytes)."
     fi
   else
     MM_ERR_TEXT="$(head -n 5 "$MULTIMODAL_ERR" 2>/dev/null | tr '\n' ' ')"
-    emit_log "WARN" "interpretacao_axet" "Falha na análise multimodal ($MM_ERR_TEXT). Acionando fallback tradicional de áudio..."
+    emit_log "WARN" "interpretacao_axet" "Aviso no OCR de telas ($MM_ERR_TEXT). Prosseguindo com a transcrição..."
   fi
 fi
 
-if [[ "$MULTIMODAL_SUCCESS" != true ]]; then
-  echo "[3/4] Interpretando a transcrição com axet-code (modelo: $AXET_MODEL_LABEL)..."
-  emit_log "INFO" "interpretacao_axet" "Iniciando análise com axet-code (modelo: $AXET_MODEL_LABEL)."
+echo "[3/4] Interpretando a transcrição e gerando relatório técnico via axet-code (modelo: $AXET_MODEL_LABEL)..."
+emit_log "INFO" "interpretacao_axet" "Iniciando síntese RAG com axet-code (modelo: $AXET_MODEL_LABEL)."
 
-  PROMPT_FILE="$(mktemp -t axet_prompt_XXXXXX.txt)"
+PROMPT_FILE="$(mktemp -t axet_prompt_XXXXXX.txt)"
 
-  if [[ -f "$PROMPT_TEMPLATE" ]]; then
-    emit_log "INFO" "interpretacao_axet" "Montando prompt avançado com template: $(basename "$PROMPT_TEMPLATE")."
-    python3 - "$PROMPT_TEMPLATE" "$TRANSCRIPT_TXT" "$PROMPT_FILE" <<'PYEOF'
-import sys
+if [[ -f "$PROMPT_TEMPLATE" ]]; then
+  emit_log "INFO" "interpretacao_axet" "Montando prompt avançado com template: $(basename "$PROMPT_TEMPLATE")."
+  python3 - "$PROMPT_TEMPLATE" "$TRANSCRIPT_TXT" "${OCR_CONTEXT_FILE:-}" "$PROMPT_FILE" <<'PYEOF'
+import sys, os
 
-template_path, transcript_path, out_path = sys.argv[1:4]
+template_path, transcript_path, ocr_path, out_path = sys.argv[1:5]
 
-with open(template_path, "r", encoding="utf-8") as f:
+with open(template_path, "r", encoding="utf-8", errors="replace") as f:
     template = f.read()
 
-with open(transcript_path, "r", encoding="utf-8") as f:
+with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
     transcript = f.read()
 
-if "{{TRANSCRICAO}}" in template:
-    final_prompt = template.replace("{{TRANSCRICAO}}", transcript)
+ocr_text = ""
+if ocr_path and os.path.isfile(ocr_path):
+    with open(ocr_path, "r", encoding="utf-8", errors="replace") as f:
+        ocr_text = f.read().strip()
+
+if ocr_text:
+    full_context = f"# EVIDÊNCIAS VISUAIS EXTRAÍDAS DAS TELAS E SLIDES DO VÍDEO (OCR MULTIMODAL)\n{ocr_text}\n\n---\n\n# TRANSCRIÇÃO ORIGINAL DA FALA (WHISPER)\n```text\n{transcript}\n```\n"
 else:
-    final_prompt = f"{template}\n\n---\n\n# TRANSCRIÇÃO ORIGINAL PARA ANÁLISE\n\n```\n{transcript}\n```\n"
+    full_context = transcript
+
+if "{{CONTEUDO_ENTRADA}}" in template:
+    final_prompt = template.replace("{{CONTEUDO_ENTRADA}}", full_context)
+elif "{{TRANSCRICAO}}" in template:
+    if ocr_text:
+        combined = f"{ocr_text}\n\n---\n\n{transcript}"
+        final_prompt = template.replace("{{TRANSCRICAO}}", combined)
+    else:
+        final_prompt = template.replace("{{TRANSCRICAO}}", transcript)
+else:
+    final_prompt = f"{template}\n\n---\n\n# CONTEÚDO PARA ANÁLISE\n\n```\n{full_context}\n```\n"
 
 with open(out_path, "w", encoding="utf-8") as f:
     f.write(final_prompt)
 PYEOF
-  else
-    emit_log "WARN" "interpretacao_axet" "Template de prompt não encontrado em $PROMPT_TEMPLATE. Usando template básico."
-    TRANSCRIPT_CONTENT="$(cat "$TRANSCRIPT_TXT")"
-    cat > "$PROMPT_FILE" <<PROMPT_EOF
+else
+  emit_log "WARN" "interpretacao_axet" "Template de prompt não encontrado em $PROMPT_TEMPLATE. Usando template básico."
+  TRANSCRIPT_CONTENT="$(cat "$TRANSCRIPT_TXT")"
+  cat > "$PROMPT_FILE" <<PROMPT_EOF
 Você é um especialista sênior em análise de transcrições, documentação funcional, arquitetura de sistemas e processos de negócio.
 Sua tarefa é analisar profundamente a transcrição e produzir um documento estruturado completo sem alucinações.
 
@@ -640,36 +659,83 @@ Sua tarefa é analisar profundamente a transcrição e produzir um documento est
 TRANSCRIÇÃO ORIGINAL:
 $TRANSCRIPT_CONTENT
 PROMPT_EOF
-  fi
-
-  PROMPT_SIZE=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
-  emit_log "INFO" "interpretacao_axet" "Enviando prompt (${PROMPT_SIZE} bytes) para axet-code (modelo: $AXET_MODEL_LABEL)..."
-
-  AXET_CMD=(axet-code run --quiet)
-  if [[ -n "${AXET_MODEL:-}" && "$AXET_MODEL" != "default" && "$AXET_MODEL" != "auto" ]]; then
-    AXET_CMD+=(-m "$AXET_MODEL")
-  fi
-
-  AXET_ERR_FILE="$(mktemp -t axet_err_XXXXXX.txt)"
-  if ! AXET_OUTPUT="$(cat "$PROMPT_FILE" | "${AXET_CMD[@]}" 2>"$AXET_ERR_FILE")"; then
-    echo "Erro: axet-code encerrou com falha." >&2
-    if [[ -f "$AXET_ERR_FILE" ]]; then
-      tail -n 20 "$AXET_ERR_FILE" >&2 || true
-    fi
-    emit_log "ERROR" "interpretacao_axet" "Falha na chamada ao axet-code (modelo: $AXET_MODEL_LABEL)."
-    emit_step_end "interpretacao_axet" "error" 0 "axet-code falhou."
-    rm -f "$PROMPT_FILE" "$AXET_ERR_FILE"
-    exit 1
-  fi
-  rm -f "$PROMPT_FILE" "$AXET_ERR_FILE"
-
-  if [[ -z "$AXET_OUTPUT" ]]; then
-    echo "Erro: axet-code não retornou conteúdo." >&2
-    emit_log "ERROR" "interpretacao_axet" "axet-code não retornou conteúdo."
-    emit_step_end "interpretacao_axet" "error" 0 "axet-code sem retorno."
-    exit 1
-  fi
 fi
+
+PROMPT_SIZE=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+PROMPT_SIZE_KB=$(( (PROMPT_SIZE + 1023) / 1024 ))
+emit_log "INFO" "interpretacao_axet" "Enviando prompt (${PROMPT_SIZE_KB} KB) para axet-code (modelo: $AXET_MODEL_LABEL)..."
+
+AXET_CMD=(axet-code run --quiet)
+if [[ -n "${AXET_MODEL:-}" && "$AXET_MODEL" != "default" && "$AXET_MODEL" != "auto" ]]; then
+  AXET_CMD+=(-m "$AXET_MODEL")
+fi
+
+AXET_ERR_FILE="$(mktemp -t axet_err_XXXXXX.txt)"
+AXET_STREAM_OUT="$(mktemp -t axet_stream_XXXXXX.md)"
+
+# Fase 1 (15%): Contexto carregado e enviado para o modelo
+emit_step_progress "interpretacao_axet" 15 "[1/5] Contexto carregado (${PROMPT_SIZE_KB} KB). Enviando para ${AXET_MODEL_LABEL}..."
+
+# Dispara axet-code transmitindo a saída em tempo real para AXET_STREAM_OUT em background
+"${AXET_CMD[@]}" < "$PROMPT_FILE" 2>"$AXET_ERR_FILE" > "$AXET_STREAM_OUT" &
+AXET_PID=$!
+
+RAG_START_TIME=$(date +%s)
+CURRENT_RAG_PHASE=1
+
+# Loop de monitoramento ativo: combina tempo de inferência com detecção de cabeçalhos/bytes
+while kill -0 "$AXET_PID" 2>/dev/null; do
+  sleep 1
+  ELAPSED=$(( $(date +%s) - RAG_START_TIME ))
+  STREAM_BYTES=0
+  [[ -s "$AXET_STREAM_OUT" ]] && STREAM_BYTES=$(wc -c < "$AXET_STREAM_OUT" | tr -d ' ')
+
+  # Fase 5 (90%): Perguntas & Respostas de Alta Relevância RAG / Fechamento
+  if [[ "$CURRENT_RAG_PHASE" -lt 5 ]] && { [[ "$STREAM_BYTES" -ge 20000 ]] || grep -q -i -E "^#+.*([Pp]erguntas|[Rr]espostas|Q&A|FAQ|[Cc]asos [Cc]oncretos|[Rr]oadmap)" "$AXET_STREAM_OUT" 2>/dev/null || [[ $ELAPSED -ge 40 ]]; }; then
+    CURRENT_RAG_PHASE=5
+    emit_step_progress "interpretacao_axet" 90 "[5/5] Formulando Perguntas & Respostas de Alta Relevância RAG..."
+  # Fase 4 (75%): Entidades, APIs e Pontos de Integração
+  elif [[ "$CURRENT_RAG_PHASE" -lt 4 ]] && { [[ "$STREAM_BYTES" -ge 12000 ]] || grep -q -i -E "^#+.*([Ee]ntidade|[Aa][Pp][Ii]|[Ii]ntegra|[Mm]odelo de [Ii]ntegra|[Mm]odelo [Oo]peracional|[Gg]overnan)" "$AXET_STREAM_OUT" 2>/dev/null || [[ $ELAPSED -ge 25 ]]; }; then
+    CURRENT_RAG_PHASE=4
+    emit_step_progress "interpretacao_axet" 75 "[4/5] Mapeando Entidades, APIs e Pontos de Integração..."
+  # Fase 3 (55%): Regras de Negócio e Módulos TRON
+  elif [[ "$CURRENT_RAG_PHASE" -lt 3 ]] && { [[ "$STREAM_BYTES" -ge 4000 ]] || grep -q -i -E "^#+.*([Rr]egras? de [Nn]eg|[Mm][oó]dulo|[Aa]rquitetura|[Cc]omponentes?|[Ff]uncionamento|TRON)" "$AXET_STREAM_OUT" 2>/dev/null || [[ $ELAPSED -ge 14 ]]; }; then
+    CURRENT_RAG_PHASE=3
+    emit_step_progress "interpretacao_axet" 55 "[3/5] Estruturando Regras de Negócio e Módulos TRON..."
+  # Fase 2 (35%): Visão Geral, Atores e Casos de Uso
+  elif [[ "$CURRENT_RAG_PHASE" -lt 2 ]] && { [[ "$STREAM_BYTES" -ge 600 ]] || grep -q -i -E "^#+.*([Vv]is[aã]o [Gg]eral|[Ss][ií]ntese|[Cc]ontexto|[Aa]tores|[Cc]asos? de [Uu]so|[Pp]roblema)" "$AXET_STREAM_OUT" 2>/dev/null || [[ $ELAPSED -ge 5 ]]; }; then
+    CURRENT_RAG_PHASE=2
+    emit_step_progress "interpretacao_axet" 35 "[2/5] Sintetizando Visão Geral, Atores e Casos de Uso..."
+  fi
+done
+
+# Aguarda término e checa status do processo
+wait "$AXET_PID"
+AXET_EXIT_CODE=$?
+
+if [[ $AXET_EXIT_CODE -ne 0 ]]; then
+  echo "Erro: axet-code encerrou com falha (código $AXET_EXIT_CODE)." >&2
+  if [[ -f "$AXET_ERR_FILE" ]]; then
+    tail -n 20 "$AXET_ERR_FILE" >&2 || true
+  fi
+  emit_log "ERROR" "interpretacao_axet" "Falha na chamada ao axet-code (modelo: $AXET_MODEL_LABEL)."
+  emit_step_end "interpretacao_axet" "error" 0 "axet-code falhou."
+  rm -f "$PROMPT_FILE" "$AXET_ERR_FILE" "$AXET_STREAM_OUT"
+  exit 1
+fi
+
+AXET_OUTPUT="$(cat "$AXET_STREAM_OUT" 2>/dev/null || true)"
+rm -f "$PROMPT_FILE" "$AXET_ERR_FILE" "$AXET_STREAM_OUT"
+
+if [[ -z "$AXET_OUTPUT" ]]; then
+  echo "Erro: axet-code não retornou conteúdo." >&2
+  emit_log "ERROR" "interpretacao_axet" "axet-code não retornou conteúdo."
+  emit_step_end "interpretacao_axet" "error" 0 "axet-code sem retorno."
+  exit 1
+fi
+
+# Fase Final (100%): Concluído com sucesso
+emit_step_progress "interpretacao_axet" 100 "Relatório estruturado gerado com sucesso."
 
 STEP3_DUR=$(( $(date +%s) - STEP3_START ))
 echo "      -> Análise avançada gerada (${STEP3_DUR}s)."

@@ -31,7 +31,7 @@ DEFAULT_VISION_MODEL = "eu.anthropic.claude-sonnet-5"
 DEFAULT_SYNTHESIS_MODEL = "gpt-5.6-terra"
 
 def read_file(filepath: str) -> str:
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 def load_frames(frames_dir: str, max_frames: int = 15) -> list:
@@ -198,6 +198,18 @@ def call_gateway_text_synthesis(gateway_url: str, model: str, prompt_text: str) 
         return "\n\n".join(parts).strip()
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--ocr-only":
+        frames_dir = os.path.abspath(sys.argv[2])
+        out_ocr_path = os.path.abspath(sys.argv[3]) if len(sys.argv) > 3 else "ocr_context.txt"
+        gateway_url = os.environ.get("LLM_GATEWAY_URL", DEFAULT_GATEWAY_URL)
+        frames = load_frames(frames_dir, max_frames=15)
+        ocr_visual_context = extract_ocr_from_frames(gateway_url, DEFAULT_VISION_MODEL, frames)
+        os.makedirs(os.path.dirname(os.path.abspath(out_ocr_path)), exist_ok=True)
+        with open(out_ocr_path, "w", encoding="utf-8") as f:
+            f.write(ocr_visual_context or "")
+        sys.stderr.write(f"OCR salvo em {out_ocr_path} ({len(ocr_visual_context)} bytes).\n")
+        sys.exit(0)
+
     if len(sys.argv) < 5:
         sys.stderr.write("Uso: python3 scripts/analyze_video_multimodal.py <transcript_txt> <frames_dir> <prompt_template> <output_md> [model_name]\n")
         sys.exit(1)

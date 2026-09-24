@@ -1905,8 +1905,11 @@ function applyEvent(evt) {
     case "step_progress":
       run.steps[step] = run.steps[step] || {};
       run.steps[step].progress_pct = evt.pct != null ? evt.pct : run.steps[step].progress_pct;
+      if (message || evt.detalhes) {
+        run.steps[step].detalhes = message || evt.detalhes;
+      }
       // Atualiza estado local na memória do item, mas NÃO dispara broadcastBatchState completo a cada timestamp
-      updateBatchItemStep(run_id, step, run.steps[step].progress_pct, null, false);
+      updateBatchItemStep(run_id, step, run.steps[step].progress_pct, run.steps[step].detalhes || null, false);
       break;
 
     case "step_end":
@@ -2386,6 +2389,7 @@ const server = http.createServer((req, res) => {
         updateBatchStats();
       }
 
+      saveBatchManifest(true);
       broadcastBatchState();
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ ok: true, batch: getBatchSnapshot() }));
